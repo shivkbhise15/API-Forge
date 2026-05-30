@@ -142,7 +142,8 @@ class AuthService {
     const isPasswordValid = await user.comparePassword(password);
 
     if (!isPasswordValid) {
-      // Increment failed attempts
+      // Only increment lockout counter for genuinely wrong passwords.
+      // Wrong password = potential attacker. Unverified email = our own flow.
       const attempts = user.loginAttempts + 1;
       const updateData = { loginAttempts: attempts };
 
@@ -158,12 +159,13 @@ class AuthService {
       throw new UnauthorizedError(MESSAGES.AUTH.INVALID_CREDENTIALS);
     }
 
+    // Password is correct — now check account state
+    // These checks come AFTER password validation so we never burn the
+    // lockout counter for valid credentials blocked by our own flows.
+
     // Check email verification
     if (!user.isEmailVerified) {
-      throw new ApiError(
-        HTTP_STATUS.FORBIDDEN,
-        MESSAGES.AUTH.EMAIL_NOT_VERIFIED,
-      );
+      throw new ApiError(HTTP_STATUS.FORBIDDEN, MESSAGES.AUTH.EMAIL_NOT_VERIFIED);
     }
 
     // Check active status
@@ -171,13 +173,14 @@ class AuthService {
       throw new ApiError(HTTP_STATUS.FORBIDDEN, MESSAGES.AUTH.ACCOUNT_INACTIVE);
     }
 
-    // Reset login attempts on successful login
+    // Password correct + account valid — reset any failed attempt counters
     if (user.loginAttempts > 0 || user.lockUntil) {
       await User.updateOne(
         { _id: user._id },
         { loginAttempts: 0, lockUntil: null },
       );
     }
+
 
     // Issue tokens
     const { accessToken, refreshToken } = await this.issueTokenPair(user);

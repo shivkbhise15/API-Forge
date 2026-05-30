@@ -34,13 +34,20 @@ export const Register = () => {
         setDone(true);
       }
     } catch (err) {
+      const status      = err.response?.status;
+      const serverMsg   = err.response?.data?.message;
       const fieldErrors = err.response?.data?.errors || [];
+
       if (fieldErrors.length) {
         const erMap = {};
         fieldErrors.forEach(e => { erMap[e.field] = e.message; });
         setErrors(erMap);
+      } else if (status === 429) {
+        toast.error(serverMsg || 'Too many attempts. Please wait 15 minutes and try again.');
+      } else if (status === 409) {
+        toast.error('An account with this email already exists. Try signing in instead.');
       } else {
-        toast.error(err.response?.data?.message || 'Registration failed');
+        toast.error(serverMsg || 'Registration failed. Please try again.');
       }
     } finally {
       setLoading(false);

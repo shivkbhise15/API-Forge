@@ -28,17 +28,20 @@ export const Login = () => {
       toast.success('Welcome back!');
       navigate('/dashboard');
     } catch (err) {
-      const status = err.response?.status;
+      const status      = err.response?.status;
+      const serverMsg   = err.response?.data?.message;
       const fieldErrors = err.response?.data?.errors || [];
 
       if (fieldErrors.length) {
         const erMap = {};
         fieldErrors.forEach(e => { erMap[e.field] = e.message; });
         setErrors(erMap);
+      } else if (status === 429) {
+        toast.error(serverMsg || 'Too many attempts. Please wait 15 minutes and try again.');
       } else if (status === 403) {
         toast.error('Please verify your email before signing in. Check your inbox.');
       } else {
-        toast.error(err.response?.data?.message || 'Login failed. Please try again.');
+        toast.error(serverMsg || 'Login failed. Please try again.');
       }
     } finally {
       setLoading(false);

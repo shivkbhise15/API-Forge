@@ -2,36 +2,17 @@
  * @file rateLimiter.middleware.js
  * @description Redis-backed rate limiting middleware.
  *
- * Architecture:
- *   Three tiers of rate limiting, each with a different scope:
+ * Three tiers of rate limiting:
  *
- *   [1] globalRateLimiter — IP-based, protects the entire API surface
- *       Applied globally in app.js before any route matching.
- *       Prevents DDoS and brute-force enumeration.
+ *   [1] globalRateLimiter — IP-based, 100 req / 15 min per IP on all routes
  *
- *   [2] authRateLimiter — Stricter IP-based limit for auth endpoints only
- *       Login/register are the most vulnerable to brute-force attacks.
- *       5 requests per 15 minutes per IP.
+ *   [2] authRateLimiter — Applied ONLY to login + register routes.
+ *       NOT applied to /refresh, /me, /logout — session hydration and token
+ *       refresh must never trigger "too many attempts".
+ *       dev: 100/15min  |  production: 20/15min
  *
- *   [3] apiKeyRateLimiter — Per-API-key sliding window
- *       Each API key has its own counter in Redis.
- *       Enforces the per-key rate limit defined in ApiKey.rateLimit.requestsPerMin
- *       Must be used AFTER validateApiKey middleware.
- *
- * Redis Integration:
- *   Uses Upstash Redis via @upstash/redis REST client.
- *   Falls back to express-rate-limit's in-memory store if Redis is unavailable.
- *   In-memory fallback doesn't work across multiple instances — acceptable for MVP,
- *   must be Redis for production multi-instance deployment.
- *
- * Algorithm:
- *   express-rate-limit uses a fixed window algorithm.
- *   For the per-key limiter, we implement a sliding window with Redis
- *   INCR + EXPIRE to be more accurate and fair.
- *
- * Future:
- *   - Token bucket algorithm for smoother burst handling
- *   - Separate daily quota tracking (requestsPerDay from ApiKey.rateLimit)
+ *   [3] apiKeyRateLimiter — Per-API-key sliding window (Redis INCR + EXPIRE).
+ *       Must come after validateApiKey middleware.
  */
 
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
@@ -41,103 +22,83 @@ import { TooManyRequestsError } from '../utils/ApiError.js';
 import { MESSAGES } from '../constants/messages.js';
 import { logger } from '../config/logger.js';
 
-// ── Standard response for rate limit errors ────────────────────────────────
+// ── IP extractor that strips IPv4-mapped IPv6 prefix ─────────────────────
+// express-rate-limit's ipKeyGenerator rejects "::ffff:127.0.0.1" (ERR_ERL_KEY_GEN_IPV6).
+// Stripping "::ffff:" converts it to a plain IPv4 address that passes validation.
+const getClientIp = (req) => {
+  const forwarded = req.headers['x-forwarded-for'];
+  const raw = forwarded
+    ? forwarded.split(',')[0].trim()
+    : (req.ip || req.socket?.remoteAddress || '127.0.0.1');
+
+  // Strip IPv4-mapped IPv6 prefix so ipKeyGenerator receives a valid address
+  const normalized = raw.replace(/^::ffff:/i, '');
+  return ipKeyGenerator(normalized);
+};
+
+// ── Standard 429 response ─────────────────────────────────────────────────
 const rateLimitHandler = (req, res) => {
   res.status(429).json({
-    success: false,
-    message: MESSAGES.GENERAL.RATE_LIMIT_EXCEEDED,
+    success:   false,
+    message:   MESSAGES.GENERAL.RATE_LIMIT_EXCEEDED,
+    retryAfter: 900, // 15 min in seconds
     requestId: req.requestId,
     timestamp: new Date().toISOString(),
   });
 };
 
-// ── [1] Global IP-based rate limiter ──────────────────────────────────────
+// ── [1] Global IP-based rate limiter ─────────────────────────────────────
 export const globalRateLimiter = rateLimit({
   windowMs: env.rateLimit.windowMs,
-  max: env.rateLimit.max,
+  max:      env.rateLimit.max,
   standardHeaders: true,
   legacyHeaders: false,
-
-  keyGenerator: (req) => {
-    const forwardedIp = req.headers['x-forwarded-for']
-      ?.split(',')[0]
-      ?.trim();
-
-    return ipKeyGenerator(forwardedIp || req.ip);
-  },
-
+  keyGenerator: getClientIp,
   handler: rateLimitHandler,
-
   skip: (req) => req.path === '/health',
 });
-// ── [2] Auth endpoint rate limiter (stricter) ─────────────────────────────
+
+// ── [2] Auth-specific rate limiter (login + register only) ────────────────
+const AUTH_RATE_LIMIT_MAX = env.isDevelopment ? 100 : 20;
+
 export const authRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10,
+  max:      AUTH_RATE_LIMIT_MAX,
   standardHeaders: true,
   legacyHeaders: false,
-
-  keyGenerator: (req) => {
-    const forwardedIp = req.headers['x-forwarded-for']
-      ?.split(',')[0]
-      ?.trim();
-
-    return ipKeyGenerator(forwardedIp || req.ip);
+  keyGenerator: getClientIp,
+  handler: (req, res) => {
+    res.status(429).json({
+      success:    false,
+      message:    'Too many attempts. Please wait 15 minutes before trying again.',
+      retryAfter: 900,
+      requestId:  req.requestId,
+      timestamp:  new Date().toISOString(),
+    });
   },
-
-  handler: rateLimitHandler,
-  message: 'Too many authentication attempts. Please try again in 15 minutes.',
 });
 
 // ── [3] Per-API-Key sliding window rate limiter ───────────────────────────
-
-/**
- * Implements a per-minute sliding window rate limit using Redis INCR + EXPIRE.
- *
- * Algorithm:
- *   - Key format: `ratelimit:key:{keyId}:{currentMinute}`
- *   - INCR the counter for this minute
- *   - EXPIRE the key at 61 seconds (slightly longer than 1 minute for safety)
- *   - If counter > limit, reject with 429
- *
- * Why per-minute bucket instead of true sliding window?
- *   True sliding window requires ZRANGEBYSCORE queries on a sorted set.
- *   The bucket approach is O(1) and 95% accurate for practical purposes.
- *
- * @param {import('express').Request} req
- * @param {import('express').Response} res
- * @param {import('express').NextFunction} next
- */
 export const apiKeyRateLimiter = async (req, res, next) => {
-  // Must be used after validateApiKey
   if (!req.apiKey || !req.apiKeyId) return next();
 
   const redis = getRedisClient();
-
-  // If Redis is unavailable, skip per-key rate limiting (fail open)
-  // In production, you'd want to fail closed — depends on your risk tolerance
   if (!redis) {
     logger.warn('[RateLimiter] Redis unavailable — skipping per-key rate limit.');
     return next();
   }
 
   try {
-    const limitPerMin = req.apiKey.rateLimit?.requestsPerMin || 60;
-    const currentMinute = Math.floor(Date.now() / 60000); // unix minute
-    const redisKey = `ratelimit:key:${req.apiKeyId}:${currentMinute}`;
+    const limitPerMin   = req.apiKey.rateLimit?.requestsPerMin || 60;
+    const currentMinute = Math.floor(Date.now() / 60000);
+    const redisKey      = `ratelimit:key:${req.apiKeyId}:${currentMinute}`;
 
-    // Atomic increment
     const count = await redis.incr(redisKey);
+    if (count === 1) await redis.expire(redisKey, 61);
 
-    if (count === 1) {
-      // First request this minute — set expiry (61s to handle clock drift)
-      await redis.expire(redisKey, 61);
-    }
-
-    // Set rate limit headers for client visibility
-    res.setHeader('X-RateLimit-Limit', limitPerMin);
+    res.setHeader('X-RateLimit-Limit',     limitPerMin);
     res.setHeader('X-RateLimit-Remaining', Math.max(0, limitPerMin - count));
-    res.setHeader('X-RateLimit-Reset', (currentMinute + 1) * 60); // next minute
+    res.setHeader('X-RateLimit-Reset',     (currentMinute + 1) * 60);
 
     if (count > limitPerMin) {
       return next(new TooManyRequestsError(MESSAGES.API_KEY.RATE_LIMIT_EXCEEDED));
@@ -145,11 +106,10 @@ export const apiKeyRateLimiter = async (req, res, next) => {
 
     next();
   } catch (error) {
-    // On Redis error, fail open (allow request) but log it
     logger.error('[RateLimiter] Redis error during per-key rate limit check:', {
       error: error.message,
       keyId: req.apiKeyId,
     });
-    next();
+    next(); // fail open
   }
 };

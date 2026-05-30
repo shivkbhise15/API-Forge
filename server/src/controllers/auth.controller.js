@@ -23,11 +23,11 @@ import { HTTP_STATUS } from '../constants/httpStatus.js';
 import { env } from '../config/env.js';
 
 const REFRESH_COOKIE_OPTIONS = {
-  httpOnly: true,                          // not accessible via document.cookie
-  secure: env.isProduction,               // HTTPS only in production
-  sameSite: env.isProduction ? 'strict' : 'lax',
-  maxAge: 7 * 24 * 60 * 60 * 1000,       // 7 days in ms
-  path: '/api/v1/auth/refresh',           // restrict cookie to refresh endpoint only
+  httpOnly: true,                            // JS cannot read this cookie (XSS safe)
+  secure:   env.httpsOnly,                  // true only when HTTPS_ONLY=true in .env
+  sameSite: env.httpsOnly ? 'strict' : 'lax', // lax allows email-link redirects
+  maxAge:   7 * 24 * 60 * 60 * 1000,       // 7 days in ms
+  path:     '/api/v1/auth/refresh',         // scoped to refresh endpoint only
 };
 
 export const authController = {
